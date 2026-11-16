@@ -1,0 +1,69 @@
+# Local credentials; sanitized templates remain trackable.
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Python and local build caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+/build/
+/dist/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Generated analysis results (keep scripts and runtime inputs trackable)
+*.log
+*.out
+*.debug
+*.jsonl
+**/results/
+**/cmdi_closures/
+**/intoverflow_closures/
+sink_[0-9]*.json
+*_results.json
+*_summary.json
+*_exit.txt
+exit_code.txt
+/vmware_mango_kit/validation.json
+/vmware_mango_kit/mango-vm-kit/export_notes.json
+/vmware_mango_kit/mango-vm-kit.zip
+/cedar_router_httpd结果/
+
+# Experimental reports and downloaded test environments, not project sources
+/analysis_runs/**/*.json
+/analysis_runs/**/*.txt
+!/analysis_runs/**/*.lock.txt
+/analysis_runs/**/*.xml
+/analysis_runs/**/*.sha256
+/analysis_runs/**/*.deb
+/analysis_runs/**/*.whl
+/analysis_runs/**/pyvex-*.tar.gz
+/analysis_runs/**/native_debug/toolroot/
+/analysis_runs/**/native_debug/source/
+/analysis_runs/**/native_debug/pure_source/
+/analysis_runs/**/native_debug/asan_overlay/
+/analysis_runs/**/native_debug/cffi2_overlay/
+/analysis_runs/**/native_debug/py312_overlay/
+/analysis_runs/**/native_debug/ffi_cache_experiment_*/
+
+# Local planning, editor state and optional reports
+.planning/
+*.code-workspace
+.DS_Store
+Thumbs.db
+
+# Generated comparison/reproduction artifacts
+/analysis_runs/**/call_trace.diff
+/analysis_runs/**/mango_cli.diff
+/analysis_runs/**/layout_commands.gdb
+/analysis_runs/**/c_probe_inputs.bin
+/analysis_runs/**/native_probe

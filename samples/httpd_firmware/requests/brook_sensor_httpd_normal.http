@@ -1,0 +1,4 @@
+POST /api/history?record_count=16&scale_bits=2 HTTP/1.1
+Host: device.local
+Content-Length: 0
+

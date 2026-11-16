@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -u
+OUT=/mnt/c/Users/ROG/Desktop/mango_0/analysis_runs/ac12_httpd_20261116/native_debug
+MODE=${1:-register_only}
+export LD_PRELOAD=/usr/lib/gcc/x86_64-linux-gnu/13/libasan.so
+export ASAN_OPTIONS=detect_leaks=0:abort_on_error=1
+export PYTHONMALLOC=malloc
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="$OUT/asan_overlay"
+ulimit -c 0
+ARGS=(--no-faulthandler)
+if [ "$MODE" = register_only ]; then ARGS+=(--register-only); fi
+if [ "$MODE" = readonly ]; then ARGS+=(--readonly); fi
+timeout 90 /root/myenv/bin/python "$OUT/pyvex_only_probe.py" "${ARGS[@]}" > "$OUT/asan_${MODE}.log" 2>&1
+status=$?
+printf '%s\n' "$status" > "$OUT/asan_${MODE}_exit.txt"
+exit "$status"

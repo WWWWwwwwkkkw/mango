@@ -1,0 +1,162 @@
+[
+  {
+    "binary": "cedar_router_httpd",
+    "source": "src/cedar_router_httpd.c",
+    "target_function": "plan_upload",
+    "expected_cwe190": true,
+    "operation": "mul",
+    "reason": "Chunked upgrade staging: 32-bit product wraps before the staging quota check.",
+    "boundary_inputs": [
+      65537,
+      65537
+    ],
+    "mathematical_result": 4295098369,
+    "expected_boundary_status": 200,
+    "expected_boundary_reserved": 131073,
+    "expected_normal_reserved": 512
+  },
+  {
+    "binary": "harbor_nas_httpd",
+    "source": "src/harbor_nas_httpd.c",
+    "target_function": "plan_restore",
+    "expected_cwe190": true,
+    "operation": "add",
+    "reason": "Configuration archive restore: combined section lengths wrap before allocation.",
+    "boundary_inputs": [
+      4294963200,
+      8192
+    ],
+    "mathematical_result": 4294971392,
+    "expected_boundary_status": 200,
+    "expected_boundary_reserved": 4096,
+    "expected_normal_reserved": 48
+  },
+  {
+    "binary": "meadow_nvr_httpd",
+    "source": "src/meadow_nvr_httpd.c",
+    "target_function": "plan_export",
+    "expected_cwe190": true,
+    "operation": "mul",
+    "reason": "Recording export: frame size is bounded but frame count is unchecked.",
+    "boundary_inputs": [
+      1048577,
+      4096
+    ],
+    "mathematical_result": 4294971392,
+    "expected_boundary_status": 200,
+    "expected_boundary_reserved": 4096,
+    "expected_normal_reserved": 512
+  },
+  {
+    "binary": "birch_gateway_httpd",
+    "source": "src/birch_gateway_httpd.c",
+    "target_function": "plan_upload",
+    "expected_cwe190": false,
+    "operation": "mul",
+    "reason": "Checks multiplication before calculating the allocation size.",
+    "boundary_inputs": [
+      65537,
+      65537
+    ],
+    "mathematical_result": 4295098369,
+    "expected_boundary_status": 413,
+    "expected_boundary_reserved": null,
+    "expected_normal_reserved": 512
+  },
+  {
+    "binary": "coral_ap_httpd",
+    "source": "src/coral_ap_httpd.c",
+    "target_function": "plan_restore",
+    "expected_cwe190": false,
+    "operation": "add",
+    "reason": "Checks addition against remaining uint32 capacity.",
+    "boundary_inputs": [
+      4294963200,
+      8192
+    ],
+    "mathematical_result": 4294971392,
+    "expected_boundary_status": 413,
+    "expected_boundary_reserved": null,
+    "expected_normal_reserved": 48
+  },
+  {
+    "binary": "willow_camera_httpd",
+    "source": "src/willow_camera_httpd.c",
+    "target_function": "plan_snapshot",
+    "expected_cwe190": false,
+    "operation": "mul",
+    "reason": "Independent input bounds keep the product below 524288.",
+    "boundary_inputs": [
+      65537,
+      65537
+    ],
+    "mathematical_result": 4295098369,
+    "expected_boundary_status": 413,
+    "expected_boundary_reserved": null,
+    "expected_normal_reserved": 512
+  },
+  {
+    "binary": "slate_switch_httpd",
+    "source": "src/slate_switch_httpd.c",
+    "target_function": "plan_backup",
+    "expected_cwe190": false,
+    "operation": "wide_add",
+    "reason": "Addition is widened to uint64 and validated before narrowing.",
+    "boundary_inputs": [
+      4294963200,
+      8192
+    ],
+    "mathematical_result": 4294971392,
+    "expected_boundary_status": 413,
+    "expected_boundary_reserved": null,
+    "expected_normal_reserved": 48
+  },
+  {
+    "binary": "amber_mesh_httpd",
+    "source": "src/amber_mesh_httpd.c",
+    "target_function": "plan_peers",
+    "expected_cwe190": false,
+    "operation": "wide_mul",
+    "reason": "Product uses uint64 and is validated before narrowing.",
+    "boundary_inputs": [
+      65537,
+      65537
+    ],
+    "mathematical_result": 4295098369,
+    "expected_boundary_status": 413,
+    "expected_boundary_reserved": null,
+    "expected_normal_reserved": 512
+  },
+  {
+    "binary": "brook_sensor_httpd",
+    "source": "src/brook_sensor_httpd.c",
+    "target_function": "plan_history",
+    "expected_cwe190": false,
+    "operation": "shl",
+    "reason": "Shift count and discarded high bits are checked before shifting.",
+    "boundary_inputs": [
+      2147483648,
+      1
+    ],
+    "mathematical_result": 4294967296,
+    "expected_boundary_status": 413,
+    "expected_boundary_reserved": null,
+    "expected_normal_reserved": 64
+  },
+  {
+    "binary": "spruce_hub_httpd",
+    "source": "src/spruce_hub_httpd.c",
+    "target_function": "plan_bundle",
+    "expected_cwe190": false,
+    "operation": "add",
+    "reason": "Both request lengths are bounded before addition.",
+    "boundary_inputs": [
+      4294963200,
+      8192
+    ],
+    "mathematical_result": 4294971392,
+    "expected_boundary_status": 413,
+    "expected_boundary_reserved": null,
+    "expected_normal_reserved": 48
+  }
+]

@@ -1,0 +1,4 @@
+POST /api/upload?chunk_count=16&chunk_bytes=32 HTTP/1.1
+Host: device.local
+Content-Length: 0
+
