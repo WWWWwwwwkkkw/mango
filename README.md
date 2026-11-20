@@ -60,16 +60,21 @@ category remains buffer overflow analysis. The new workflow uses the existing
 width/constant filters and call-chain selection, then sends each report through
 the LLM START, per-function STEP, and FINAL phases.
 
-LLM configuration precedence is command-line options (`--llm-api-token`,
-`--llm-api-url`, `--llm-model`), then `MANGO_LLM_API_TOKEN`,
-`MANGO_LLM_API_URL`, `MANGO_LLM_MODEL`, then the existing defaults in
-`llm_overflow_analyzer.py`. A working token and model at the configured endpoint
-are required. `--llm-timeout` defaults to 60 seconds per request.
+Configure the LLM endpoint, token, and model locally with `MANGO_LLM_API_URL`,
+`MANGO_LLM_API_TOKEN`, and `MANGO_LLM_MODEL`. The corresponding command-line
+options (`--llm-api-url`, `--llm-api-token`, and `--llm-model`) take
+precedence. `--llm-timeout` defaults to 60 seconds per request.
 
-Use `--skip-llm` to save only static reports. `--max-depth` defaults to 7;
-`--int-no-cross-function` disables cross-function tracing. `--int-bits`,
-`--int-ops`, and `--int-limit` restrict detection. The limit applies before
-width and constant filtering, so fewer reports may be produced.
+For a VMware static-only run, use `--skip-llm` without configuring an LLM.
+
+```bash
+mango /path/to/binary -c intoverflow --skip-llm --results ./results_static
+```
+
+`--max-depth` defaults to 7. `--int-no-cross-function` disables cross-function
+tracing. `--int-bits`, `--int-ops`, and `--int-limit` restrict detection. The
+limit applies before width and constant filtering, so fewer reports may be
+produced.
 
 Results include `intoverflow_results.json` (latest run summary),
 `intoverflow_mango.out` (appended log), and `intoverflow/<run-id>/` containing

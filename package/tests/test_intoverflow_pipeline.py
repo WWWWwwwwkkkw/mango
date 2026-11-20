@@ -40,6 +40,11 @@ class PipelineTests(unittest.TestCase):
         self.detector.save_sink_reports = save
         self.addCleanup(patch.stopall)
         patch.dict(sys.modules, {self.detector.__name__: self.detector}).start()
+        patch.dict("os.environ", {
+            "MANGO_LLM_API_URL": "https://example.invalid/v1/chat/completions",
+            "MANGO_LLM_API_TOKEN": "fixture-token",
+            "MANGO_LLM_MODEL": "fixture-model",
+        }).start()
 
     def summary(self):
         return json.loads((Path(self.args.result_path) / "intoverflow_results.json").read_text())
@@ -79,6 +84,7 @@ class PipelineTests(unittest.TestCase):
             self.args.skip_llm = True
             self.assertEqual(pipeline.run_from_args(self.args), 0)
             self.assertEqual(self.summary()["status"], "static_only")
+            self.assertIs(self.detector.run_detection.call_args.kwargs["include_operand_origins"], False)
             request.assert_not_called()
 
     def test_invalid_verdict_is_failure(self):
@@ -91,10 +97,20 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(pipeline.run_from_args(self.args), 1)
         self.assertEqual(self.summary()["status"], "failed")
 
-    def test_missing_token_fails_before_detection(self):
-        with patch.dict("os.environ", {"MANGO_LLM_API_TOKEN": ""}), patch.object(llm, "DEFAULT_API_TOKEN", ""):
-            self.assertEqual(pipeline.run_from_args(self.args), 1)
+    def test_missing_llm_configuration_fails_before_detection(self):
+        self.detector.run_detection.return_value = []
+        with patch.object(llm, "_post_json") as request:
+            for name in ("MANGO_LLM_API_URL", "MANGO_LLM_API_TOKEN", "MANGO_LLM_MODEL"):
+                with self.subTest(name=name), patch.dict("os.environ", {name: ""}):
+                    self.assertEqual(pipeline.run_from_args(self.args), 1)
+            request.assert_not_called()
         self.detector.run_detection.assert_not_called()
+
+    def test_standalone_llm_uses_environment_configuration(self):
+        args = llm._cli_args(["--results", str(self.root), "--model", "cli-model"])
+        self.assertTrue(args.api_url == "https://example.invalid/v1/chat/completions", "API URL must come from the environment")
+        self.assertTrue(args.api_token == "fixture-token", "API token must come from the environment")
+        self.assertEqual(args.model, "cli-model")
 
     def test_configuration_precedence(self):
         self.args.llm_model = "cli-model"

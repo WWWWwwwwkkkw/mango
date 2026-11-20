@@ -29,14 +29,12 @@ from angr.code_location import CodeLocation
 from angr.knowledge_plugins.functions import Function
 import pyvex
 
-from argument_resolver.utils.vex_helpers import (
-    DIRTY_STMT_TYPES,
-    block_has_dirty_statements,
-)
+from argument_resolver.utils.loop_counters import MAX_COUNTER_STEP, LoopBranches, counter_step, is_counter_update
+from argument_resolver.utils.vex_helpers import block_has_dirty_statements
 
 _DEFAULT_OP_NAMES = ("Add", "Sub", "Mul", "Shl")
 _DEFAULT_BIT_WIDTHS = (8, 16, 32, 64)
-_WIDEN_OP_RE = re.compile(r"Iop_(\d+)([SU])to(\d+)")
+_CAST_OP_RE = re.compile(r"Iop_(\d+)([SU]?)to(\d+)")
 
 
 def _normalize_op_name(name: str) -> str:
@@ -86,6 +84,8 @@ class OperandWidthState:
     source_width: Optional[int]
     signed: Optional[bool]
     origin: str
+    # Inclusive unsigned bit-pattern bounds. None denotes the full width.
+    unsigned_bounds: Optional[Tuple[int, int]] = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +110,7 @@ class ArithmeticOperation:
     notes: Dict[str, bool] = field(default_factory=dict)
     operand_states: Tuple[OperandWidthState, ...] = field(default_factory=tuple)
     widen_uses: Tuple[FollowupWiden, ...] = field(default_factory=tuple)
+    narrow_use_width: Optional[int] = None
 
     def code_location(self) -> CodeLocation:
         """
@@ -143,6 +144,7 @@ class RegUsage:
     kind: str
     target_reg: Optional[int] = None
     produced_tmp: Optional[int] = None
+    read_width: Optional[int] = None
 
 
 @dataclass
@@ -162,6 +164,7 @@ class IRSBUseDef:
         self.block = block
         self.arch = arch
         self.def_tmp: Dict[int, int] = {}
+        self._width_cache: Dict[Tuple[int, int], OperandWidthState] = {}
         self.uses_tmp: Dict[int, List[UsageSite]] = defaultdict(list)
         self.uses_reg: Dict[int, List[RegUsage]] = defaultdict(list)
         self.arith_nodes: List[Tuple[int, str, int, Optional[int]]] = []
@@ -243,7 +246,7 @@ class IRSBUseDef:
             return
         if isinstance(expr, pyvex.IRExpr.Get):
             self.uses_reg[expr.offset].append(
-                RegUsage(ctx.stmt_idx, ctx.kind, ctx.target_reg, ctx.produced_tmp)
+                RegUsage(ctx.stmt_idx, ctx.kind, ctx.target_reg, ctx.produced_tmp, self._expr_result_bits(expr))
             )
             if ctx.produced_tmp is not None and self._is_sp(expr.offset):
                 self.pointerish_tmps.add(ctx.produced_tmp)
@@ -623,13 +626,17 @@ class IRSBUseDef:
             exprs = (data.args[0],)
         else:
             exprs = ()
-        return tuple(self._operand_width_state(expr, set(), 0) for expr in exprs)
+        return tuple(self._operand_width_state(expr, 10) for expr in exprs)
 
     def followup_widens(self, tmp_id: int) -> Tuple[FollowupWiden, ...]:
         uses = self.uses_tmp.get(tmp_id, [])
         widens: List[FollowupWiden] = []
+        statements = self.block.vex.statements
         for use in uses:
-            stmt = self.block.vex.statements[use.stmt_idx]
+            # IRSB.next uses an index after the last statement; it is not a WrTmp.
+            if not 0 <= use.stmt_idx < len(statements):
+                continue
+            stmt = statements[use.stmt_idx]
             if not isinstance(stmt, pyvex.IRStmt.WrTmp):
                 continue
             data = stmt.data
@@ -647,73 +654,111 @@ class IRSBUseDef:
             widens.append(FollowupWiden(dst_width=dst_bits, signed=signed))
         return tuple(widens)
 
-    def _operand_width_state(
-        self, expr, seen: Set[int], depth: int
-    ) -> OperandWidthState:
-        if depth > 10:
-            return OperandWidthState(None, None, None, "unknown")
+    def _later_register_reads(self, write_idx: int) -> Iterator[RegUsage]:
+        put = self.block.vex.statements[write_idx]
+        if not isinstance(put.data, pyvex.IRExpr.RdTmp):
+            return
+        width = self._expr_result_bits(put.data)
+        if not width:
+            return
+        # Include later overlapping subregisters. An intervening overwrite
+        # can only make this guard keep an extra candidate.
+        for offset in range(put.offset, put.offset + (width + 7) // 8):
+            for read in self.uses_reg.get(offset, ()):
+                if read.stmt_idx > write_idx:
+                    yield read
+
+    def narrow_use_width(self, tmp_id: int) -> Optional[int]:
+        """Find the narrowest local value use through copies and integer casts."""
+        minimum = None
+        work = [tmp_id]
+        visited = set()
+        while work:
+            tmp = work.pop()
+            if tmp in visited:
+                continue
+            visited.add(tmp)
+            for use in self.uses_tmp.get(tmp, ()):
+                # A subregister read can narrow a value without an IR cast.
+                if use.kind == "put_reg":
+                    for read in self._later_register_reads(use.stmt_idx):
+                        if read.read_width:
+                            minimum = min(minimum or read.read_width, read.read_width)
+                        if read.produced_tmp is not None:
+                            data = self.block.vex.statements[read.stmt_idx].data
+                            if isinstance(data, pyvex.IRExpr.Get):
+                                work.append(read.produced_tmp)
+                if use.produced_tmp is None:
+                    continue
+                data = self.block.vex.statements[use.stmt_idx].data
+                if isinstance(data, pyvex.IRExpr.RdTmp):
+                    work.append(use.produced_tmp)
+                    continue
+                cast = self._match_cast_op(data)
+                if cast and isinstance(data.args[0], pyvex.IRExpr.RdTmp) and data.args[0].tmp == tmp:
+                    src, _, dst = cast
+                    if dst < src:
+                        minimum = dst if minimum is None else min(minimum, dst)
+                    work.append(use.produced_tmp)
+        return minimum
+
+    def _operand_width_state(self, expr, budget: int) -> OperandWidthState:
+        width = self._expr_result_bits(expr)
+        if not width or budget <= 0:
+            return OperandWidthState(width, None, None, "unknown")
         if isinstance(expr, pyvex.IRExpr.RdTmp):
-            if expr.tmp in seen:
-                return OperandWidthState(None, None, None, "unknown")
-            seen.add(expr.tmp)
-            def_idx = self.def_tmp.get(expr.tmp)
-            if def_idx is None:
-                return OperandWidthState(None, None, None, "unknown")
-            stmt = self.block.vex.statements[def_idx]
-            if isinstance(stmt, DIRTY_STMT_TYPES):
-                return OperandWidthState(None, None, None, "dirty")
-            data = getattr(stmt, "data", None)
-            if data is None:
-                return OperandWidthState(None, None, None, "unknown")
-            match = self._match_cast_op(data)
-            if match:
-                src_bits, signed, dst_bits = match
-                if src_bits < dst_bits:
-                    return OperandWidthState(dst_bits, src_bits, signed, "widen")
-                if src_bits > dst_bits:
-                    return OperandWidthState(dst_bits, src_bits, signed, "trunc")
-            return self._operand_width_state(data, seen, depth + 1)
-        if isinstance(expr, pyvex.IRExpr.Get):
-            reg_name = self.arch.register_names.get(expr.offset)
-            width = None
-            if reg_name:
-                reg_info = self.arch.registers.get(reg_name)
-                if reg_info:
-                    width = reg_info[1] * 8
-            if width is None:
-                width = self.arch.bits or None
-            return OperandWidthState(width, None, None, "register")
+            key = (expr.tmp, budget)
+            if key not in self._width_cache:
+                idx = self.def_tmp.get(expr.tmp)
+                stmt = self.block.vex.statements[idx] if idx is not None else None
+                if isinstance(stmt, pyvex.IRStmt.WrTmp):
+                    state = self._operand_width_state(stmt.data, budget - 1)
+                else:
+                    state = OperandWidthState(width, None, None, "unknown")
+                self._width_cache[key] = state
+            return self._width_cache[key]
         if isinstance(expr, pyvex.IRExpr.Const):
-            width = self._expr_result_bits(expr)
-            return OperandWidthState(width, None, None, "const")
+            value = expr.con.value
+            return OperandWidthState(width, None, None, "const", (value, value))
+        if isinstance(expr, pyvex.IRExpr.Get):
+            return OperandWidthState(width, None, None, "register")
         if isinstance(expr, pyvex.IRExpr.Load):
-            width = self._expr_result_bits(expr)
             return OperandWidthState(width, None, None, "memory")
-        if isinstance(expr, pyvex.IRExpr.Unop):
-            match = self._match_cast_op(expr)
-            if match:
-                src_bits, signed, dst_bits = match
-                if src_bits < dst_bits:
-                    return OperandWidthState(dst_bits, src_bits, signed, "widen")
-                if src_bits > dst_bits:
-                    return OperandWidthState(dst_bits, src_bits, signed, "trunc")
-            width = self._expr_result_bits(expr)
-            origin = "computed" if width is not None else "unknown"
-            return OperandWidthState(width, None, None, origin)
-        if isinstance(
-            expr,
-            (
-                pyvex.IRExpr.Binop,
-                pyvex.IRExpr.Triop,
-                pyvex.IRExpr.Qop,
-                pyvex.IRExpr.ITE,
-                pyvex.IRExpr.CCall,
-            ),
-        ):
-            width = self._expr_result_bits(expr)
-            origin = "computed" if width is not None else "unknown"
-            return OperandWidthState(width, None, None, origin)
-        return OperandWidthState(None, None, None, "unknown")
+        cast = self._match_cast_op(expr)
+        if cast:
+            src, signed, dst = cast
+            source = self._operand_width_state(expr.args[0], budget - 1)
+            lo, hi = source.unsigned_bounds or (0, (1 << src) - 1)
+            if dst < src:
+                # A single interval survives truncation only within one modulus band.
+                mask = (1 << dst) - 1
+                bounds = (lo & mask, hi & mask) if lo >> dst == hi >> dst else None
+                return OperandWidthState(dst, src, signed, "trunc", bounds)
+            if dst > src and signed is not None:
+                bounds = (lo, hi)
+                if signed and hi >= (1 << (src - 1)):
+                    offset = (1 << dst) - (1 << src)
+                    bounds = (lo + offset, hi + offset) if lo >= (1 << (src - 1)) else None
+                return OperandWidthState(dst, src, signed, "widen", bounds)
+        if isinstance(expr, pyvex.IRExpr.Binop) and expr.op == f"Iop_And{width}":
+            for arg in expr.args:
+                if isinstance(arg, pyvex.IRExpr.Const):
+                    return OperandWidthState(width, None, None, "mask", (0, arg.con.value))
+        if isinstance(expr, pyvex.IRExpr.Binop) and expr.op == f"Iop_Shr{width}":
+            value, count = expr.args
+            if isinstance(count, pyvex.IRExpr.Const) and 0 <= count.con.value < width:
+                shift = count.con.value
+                source = self._operand_width_state(value, budget - 1)
+                lo, hi = source.unsigned_bounds or (0, (1 << width) - 1)
+                return OperandWidthState(width, None, None, "computed", (lo >> shift, hi >> shift))
+        if isinstance(expr, pyvex.IRExpr.ITE):
+            first = self._operand_width_state(expr.iftrue, budget - 1).unsigned_bounds
+            if first is not None:
+                second = self._operand_width_state(expr.iffalse, budget - 1).unsigned_bounds
+                if second is not None:
+                    bounds = min(first[0], second[0]), max(first[1], second[1])
+                    return OperandWidthState(width, None, None, "computed", bounds)
+        return OperandWidthState(width, None, None, "computed")
 
     def _expr_result_bits(self, expr) -> Optional[int]:
         if expr is None:
@@ -731,7 +776,7 @@ class IRSBUseDef:
         op = getattr(expr, "op", None)
         if not op:
             return None
-        match = _WIDEN_OP_RE.match(op)
+        match = _CAST_OP_RE.fullmatch(op)
         if not match:
             return None
         src_bits = int(match.group(1))
@@ -769,6 +814,7 @@ class IntegerOverflowScanner:
         logger: Optional[logging.Logger] = None,
     ):
         self.project = project
+        self.loop_counter_skips = 0
         self.logger = logger or logging.getLogger(__name__)
         self.bit_widths: Set[int] = set(bit_widths or _default_bit_widths(project))
         self.base_ops: Set[str] = { _normalize_op_name(op) for op in (op_names or _DEFAULT_OP_NAMES) }
@@ -783,23 +829,27 @@ class IntegerOverflowScanner:
         function_addrs: Optional[Sequence[int]] = None,
         min_addr: Optional[int] = None,
         max_addr: Optional[int] = None,
+        value_sinks_only: bool = False,
     ) -> List[ArithmeticOperation]:
         """
-        Iterate over the requested functions and collect matching arithmetic statements.
+        Collect matching arithmetic statements. In detection mode, build metadata
+        only for value arithmetic with an instruction address.
         """
 
         allowed_funcs = self._resolve_function_filter(function_names, function_addrs)
         operations: List[ArithmeticOperation] = []
         seen: Set[Tuple[int, int, int]] = set()
+        self.loop_counter_skips = 0
 
         for func in self._iter_functions(allowed_funcs):
+            loops = LoopBranches(func) if value_sinks_only else None
             for block in self._iter_blocks(func):
-                for candidate in self._scan_block(func, block, min_addr=min_addr, max_addr=max_addr):
-                    key = (candidate.function_addr, candidate.block_addr, candidate.stmt_idx)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    operations.append(candidate)
+                operations.extend(self._scan_block(func, block, min_addr=min_addr, max_addr=max_addr,
+                                                   value_sinks_only=value_sinks_only, seen=seen, loops=loops))
+        if value_sinks_only:
+            self.logger.info("Scanner discovered %d arithmetic sinks (%d value_arith)",
+                             len(seen), len(operations) + self.loop_counter_skips)
+            self.logger.info("Loop-counter heuristic skipped %d value sinks", self.loop_counter_skips)
         return operations
 
     def _resolve_function_filter(
@@ -846,6 +896,9 @@ class IntegerOverflowScanner:
         *,
         min_addr: Optional[int],
         max_addr: Optional[int],
+        value_sinks_only: bool = False,
+        seen: Optional[Set[Tuple[int, int, int]]] = None,
+        loops: Optional[LoopBranches] = None,
     ) -> Iterator[ArithmeticOperation]:
         if block_has_dirty_statements(block):
             self.logger.debug(
@@ -857,6 +910,7 @@ class IntegerOverflowScanner:
 
         analyzer = IRSBUseDef(block, self.project.arch)
         statements = block.vex.statements
+        branch = None
         for tmp_id, op_name, stmt_idx, ins_addr in analyzer.arith_nodes:
             if op_name not in self.target_ops:
                 continue
@@ -865,8 +919,25 @@ class IntegerOverflowScanner:
             if max_addr is not None and ins_addr is not None and ins_addr > max_addr:
                 continue
 
+            if seen is not None:
+                key = (func.addr, block.addr, stmt_idx)
+                if key in seen:
+                    continue
+                seen.add(key)
+            classification, notes = analyzer.classify_tmp(tmp_id)
+            if value_sinks_only and (classification != "value_arith" or not ins_addr):
+                continue
+
             stmt = statements[stmt_idx]
             data = stmt.data
+            if loops is not None:
+                step = counter_step(data)
+                if step and 0 < abs(step[0]) <= MAX_COUNTER_STEP:
+                    if branch is None:
+                        branch = loops.branch(analyzer, self.project) or ()
+                    if branch and is_counter_update(analyzer, stmt_idx, step[1], *branch, self.project):
+                        self.loop_counter_skips += 1
+                        continue
             if isinstance(data, pyvex.IRExpr.Binop):
                 operand0 = self._expr_to_text(data.args[0])
                 operand1 = self._expr_to_text(data.args[1])
@@ -877,7 +948,6 @@ class IntegerOverflowScanner:
                 operand0 = ""
                 operand1 = ""
             bit_width = data.result_size(block.vex.tyenv)
-            classification, notes = analyzer.classify_tmp(tmp_id)
             operand_states = analyzer.operand_width_states(stmt_idx)
             widen_uses = analyzer.followup_widens(tmp_id)
             yield ArithmeticOperation(
@@ -895,6 +965,7 @@ class IntegerOverflowScanner:
                 notes=notes,
                 operand_states=operand_states,
                 widen_uses=widen_uses,
+                narrow_use_width=analyzer.narrow_use_width(tmp_id) if classification == "value_arith" else None,
             )
 
     def _expr_to_text(self, expr) -> str:

@@ -31,7 +31,7 @@ def add_cli_arguments(parser):
     group = parser.add_argument_group("Integer overflow", "Options for -c intoverflow")
     group.add_argument("--int-bits", nargs="+", type=int, choices=[8, 16, 32, 64])
     group.add_argument("--int-ops", nargs="+", help="VEX operations, e.g. Add Sub Mul Shl")
-    group.add_argument("--int-limit", type=positive_int, help="Candidate limit before width/constant filtering")
+    group.add_argument("--int-limit", type=positive_int, help="Candidate limit before width screening")
     group.add_argument("--int-no-cross-function", action="store_true")
     group.add_argument("--skip-llm", action="store_true", help="Save static reports only")
     group.add_argument("--llm-api-url")
@@ -115,8 +115,10 @@ def run_from_args(args):
                     for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                         digest.update(chunk)
                 summary["sha256"] = digest.hexdigest()
-                if not args.skip_llm and not api_options["api_token"]:
-                    raise ValueError("Missing LLM API token")
+                if not args.skip_llm and not all(api_options[key] for key in ("api_url", "api_token", "model")):
+                    print("[intoverflow] Set MANGO_LLM_API_URL, MANGO_LLM_API_TOKEN, and MANGO_LLM_MODEL "
+                          "or pass --skip-llm.", file=sys.stderr)
+                    raise ValueError("Missing LLM configuration")
                 from argument_resolver.utils.integer_overflow_detection import run_detection, save_sink_reports
                 logging.getLogger(__name__).info("Static analysis: scanning and tracing arithmetic candidates")
                 stage_start = time.monotonic()
@@ -124,7 +126,7 @@ def run_from_args(args):
                     reports = run_detection(
                         str(binary), bit_widths=args.int_bits, op_names=args.int_ops,
                         max_depth=args.max_depth, cross_function=not args.int_no_cross_function,
-                        limit=args.int_limit,
+                        limit=args.int_limit, include_operand_origins=False,
                     )
                     paths = save_sink_reports(reports, str(run_dir / "sinks"))
                 finally:

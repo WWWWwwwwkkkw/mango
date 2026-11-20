@@ -5,8 +5,8 @@ inspector, and tracing utilities to surface actionable sink information.
 Workflow:
 1. Scan the binary for arithmetic operations and keep the sinks that behave like
    ``value_arith`` (operations whose result escapes as a value).
-2. Use :func:`arithmetic_operand_origin.analyze_arithmetic_operands` to drop
-   sinks whose operands ultimately originate from compile-time constants.
+2. Screen candidates by width and decode their instructions. Full in-memory
+   reports also include operand definitions and sources.
 3. Feed the remaining sinks into :func:`test_trace.trace_operands_from_address`
    to recover call-chain information.
 4. Decompile every function that appears on the call-chain so the operator can
@@ -34,10 +34,13 @@ from argument_resolver.utils.integer_overflow import (
 )
 from argument_resolver.utils.arithmetic_operand_origin import (
     analyze_arithmetic_operands,
+    describe_arithmetic_instruction,
 )
 from argument_resolver.utils.test_trace import trace_operands_from_address
 from argument_resolver.utils.vex_helpers import function_has_dirty_blocks
 from argument_resolver.utils.width_screening import screen_by_width
+from argument_resolver.utils.fixed_operand_screening import screen_fixed_operands
+from argument_resolver.utils.integer_overflow_context import BinaryAnalysisContext
 
 
 LOG = logging.getLogger(__name__)
@@ -137,42 +140,30 @@ def _collect_value_sinks(
     max_addr: Optional[int],
 ) -> List[ArithmeticOperation]:
     scanner = IntegerOverflowScanner(
-        project, bit_widths=bit_widths, op_names=op_names
+        project, bit_widths=bit_widths, op_names=op_names, logger=LOG
     )
-    sinks = scanner.scan(
+    return scanner.scan(
         function_names=function_names,
         function_addrs=function_addrs,
         min_addr=min_addr,
         max_addr=max_addr,
+        value_sinks_only=True,
     )
-    value_sinks = [
-        sink for sink in sinks if sink.classification == "value_arith" and sink.ins_addr
-    ]
-    LOG.info("Scanner discovered %d arithmetic sinks (%d value_arith)", len(sinks), len(value_sinks))
-    return value_sinks
-
-
-def _has_constant_operand(origin_report: Dict[str, object]) -> bool:
-    operands = origin_report.get("operands") or []
-    for operand in operands:
-        for definition in operand.get("definitions", []):
-            for source in definition.get("sources", []):
-                if source.get("origin") == "constant":
-                    return True
-    return False
 
 
 def _filter_constant_sinks(
-    binary_path: str, sinks: Sequence[Tuple[ArithmeticOperation, str, str]]
+    binary_path: str, sinks: Sequence[Tuple[ArithmeticOperation, str, str]],
+    *, context: Optional[BinaryAnalysisContext] = None, include_operand_origins: bool = True,
 ) -> List[Tuple[ArithmeticOperation, Dict[str, object], str, str]]:
     filtered: List[Tuple[ArithmeticOperation, Dict[str, object], str, str]] = []
-    before = len(sinks)
-    immediate_after = 0
+    # Keep the stage entry point used by diagnostic wrappers. Width screening
+    # has already evaluated constants in the context of the actual operation.
+    inspect = analyze_arithmetic_operands if include_operand_origins else describe_arithmetic_instruction
     for sink, width_status, width_reason in sinks:
         if sink.ins_addr is None:
             continue
         try:
-            origin_report = analyze_arithmetic_operands(binary_path, sink.ins_addr)
+            origin_report = inspect(binary_path, sink.ins_addr, context=context)
         except Exception as exc:  # pragma: no cover - analysis failures
             LOG.warning(
                 "Failed to analyze operands for %s @ %s: %s",
@@ -181,39 +172,25 @@ def _filter_constant_sinks(
                 exc,
             )
             continue
-        if origin_report.get("immediate_add_one"):
-            LOG.debug(
-                "Dropping %s @ %s because it is add-immediate #1",
-                sink.function,
-                hex(sink.ins_addr),
-            )
-            continue
-        immediate_after += 1
-        if _has_constant_operand(origin_report):
-            LOG.debug(
-                "Dropping %s @ %s because it uses constant operands",
-                sink.function,
-                hex(sink.ins_addr),
-            )
-            continue
         filtered.append((sink, origin_report, width_status, width_reason))
     LOG.info("Filtered sinks: kept %d / %d", len(filtered), len(sinks))
-    LOG.info("Immediate-add-one filtering: %d -> %d", before, immediate_after)
-    LOG.debug("Constant filtering: %d -> %d", immediate_after, len(filtered))
     return filtered
 
 
 def _run_trace(
-    binary_path: str, sink_addr: int, max_depth: int, cross_function: bool
+    binary_path: str, sink: ArithmeticOperation, max_depth: int, cross_function: bool,
+    *, context: Optional[BinaryAnalysisContext] = None,
 ) -> Tuple[Optional[TraceArtifact], str]:
     buffer = io.StringIO()
     trace_result = None
     with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
         trace_result = trace_operands_from_address(
             binary_path=binary_path,
-            sink_address=sink_addr,
+            sink_address=sink.ins_addr,
             max_depth=max_depth,
             cross_function=cross_function,
+            context=context,
+            arithmetic_sink=sink,
         )
     captured = buffer.getvalue()
     if trace_result is None:
@@ -269,12 +246,15 @@ def run_detection(
     max_depth: int = 7,
     cross_function: bool = True,
     limit: Optional[int] = None,
+    include_operand_origins: bool = True,
 ) -> List[SinkReport]:
     """
-    Execute the detection pipeline and return structured sink reports.
+    Return sink reports with full operand origins by default. Set
+    include_operand_origins=False for the instruction-only operand field used by the CLI.
     """
 
     project = build_project(binary_path)
+    context = BinaryAnalysisContext(project)
     value_sinks = _collect_value_sinks(
         project,
         bit_widths=bit_widths,
@@ -287,20 +267,24 @@ def run_detection(
     if limit is not None:
         value_sinks = value_sinks[:limit]
 
-    width_screened = screen_by_width(value_sinks)
+    width_screened = screen_fixed_operands(project, screen_by_width(value_sinks))
     if not width_screened:
         LOG.info("No sinks survived width screening.")
         return []
 
-    filtered_sinks = _filter_constant_sinks(binary_path, width_screened)
+    filtered_sinks = _filter_constant_sinks(binary_path, width_screened, context=context,
+                                            include_operand_origins=include_operand_origins)
     if not filtered_sinks:
         return []
 
+    # A failed global preparation may have required a clean-project retry.
+    # Every later consumer must use that recovered project as well.
+    project = context.project
     reports: List[SinkReport] = []
     decompiler = FunctionDecompiler(project)
     for sink, origin_report, width_status, width_reason in filtered_sinks:
         trace_artifact, _ = _run_trace(
-            binary_path, sink.ins_addr, max_depth, cross_function
+            binary_path, sink, max_depth, cross_function, context=context
         )
         call_chain = trace_artifact.call_chain if trace_artifact else []
         sources = _decompile_chain(decompiler, call_chain, sink)
@@ -435,6 +419,9 @@ def save_sink_reports(reports: Sequence[SinkReport], output_dir: str) -> List[st
             "sink_function": sink.function,
             "instruction": report.operand_origin.get("instruction"),
             "call_chain_functions": call_chain_functions,
+            "input_evidence": (report.trace.raw_result if report.trace else {}).get(
+                "input_evidence", {"status": "unknown", "operands": [], "analysis": "unavailable"}
+            ),
             "disassembly_context": report.disassembly_context,
             "decompiled_sources": [
                 {

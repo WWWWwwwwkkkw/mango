@@ -8,11 +8,12 @@ from the higher-level detection pipeline.
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from typing import List, Sequence, Tuple
 
-LOG = logging.getLogger(__name__)
-
 from argument_resolver.utils.integer_overflow import ArithmeticOperation, OperandWidthState
+
+LOG = logging.getLogger(__name__)
 
 WIDTH_STATUS_NO = "NO_NARROW_OVERFLOW"
 WIDTH_STATUS_POSSIBLE = "POSSIBLE"
@@ -28,106 +29,91 @@ CRITICAL_NOTE_KEYS = (
     "updates_pc",
 )
 
-ALLOWED_ORIGINS = {
-    "register",
-    "const",
-    "memory",
-    "widen",
-    "trunc",
-}
+
+def _signed_bounds(state: OperandWidthState, width: int, unsigned: Tuple[int, int]) -> Tuple[int, int]:
+    sign_bit = 1 << (width - 1)
+    lo, hi = unsigned
+    if hi < sign_bit:
+        return lo, hi
+    if lo >= sign_bit:
+        return lo - 2 * sign_bit, hi - 2 * sign_bit
+    if state.origin == "widen" and state.signed and state.source_width:
+        sign_bit = 1 << (state.source_width - 1)
+    return -sign_bit, sign_bit - 1
 
 
-def _has_critical_usage(sink: ArithmeticOperation) -> bool:
-    for key in CRITICAL_NOTE_KEYS:
-        if sink.notes.get(key):
-            return True
-    return False
-
-
-def _state_is_reliable(state: OperandWidthState, op_width: int) -> bool:
-    if state.width is None or state.width != op_width:
-        return False
-    if state.origin not in ALLOWED_ORIGINS:
-        return False
-    if state.origin == "widen":
-        return state.source_width is not None and state.source_width < state.width
-    if state.origin == "trunc":
-        return state.source_width is not None and state.source_width > state.width
-    return True
-
-
-def _all_operands_widen_before_op(
-    states: Sequence[OperandWidthState], op_width: int
-) -> bool:
-    if not states:
-        return False
-    for state in states:
-        if state.origin != "widen":
-            return False
-        if state.source_width is None or state.width is None:
-            return False
-        if state.width != op_width:
-            return False
-        if state.source_width >= op_width:
-            return False
-    return True
-
-
-def _has_range_cap_evidence(_sink: ArithmeticOperation) -> Tuple[bool, str]:
-    # Placeholder: add structural range-cap evidence here when available.
-    return False, ""
+def _result_bounds(op: str, left: Tuple[int, int], right: Tuple[int, int]) -> Tuple[int, int]:
+    a, b = left
+    c, d = right
+    if op == "Add":
+        return a + c, b + d
+    if op == "Sub":
+        return a - d, b - c
+    products = (a * c, a * d, b * c, b * d)
+    return min(products), max(products)
 
 
 def assess_width_status(sink: ArithmeticOperation) -> Tuple[str, str]:
-    states = sink.operand_states or ()
-    op_width = sink.bit_width or 0
+    width = sink.bit_width
+    states = sink.operand_states
+    if not width or len(states) != 2 or states[0].width != width:
+        return WIDTH_STATUS_POSSIBLE, "missing or incompatible operand widths"
+    if sink.vex_op == f"Iop_Shl{width}":
+        # VEX scalar shifts use an I8 count even when the value is I32 or I64.
+        count = states[1].unsigned_bounds
+        if states[1].width != 8 or count is None or count[0] != count[1] or not 0 <= count[0] < width:
+            return WIDTH_STATUS_POSSIBLE, "shift count is not a single in-range value"
+        bounds = states[0].unsigned_bounds
+        if bounds is None or not 0 <= bounds[0] <= bounds[1]:
+            return WIDTH_STATUS_POSSIBLE, "shift input range unproven"
+        output_width = min(width, sink.narrow_use_width or width)
+        if bounds[1] << count[0] < 1 << (output_width - 1):
+            return WIDTH_STATUS_NO, "nonnegative left shift fits signed and unsigned result ranges"
+        return WIDTH_STATUS_POSSIBLE, "shift may exceed operation or narrowing width"
+    if states[1].width != width:
+        return WIDTH_STATUS_POSSIBLE, "missing or incompatible operand widths"
+    op = next((name for name in ("Add", "Sub", "Mul") if sink.vex_op == f"Iop_{name}{width}"), None)
+    if op is None:
+        return WIDTH_STATUS_POSSIBLE, "operation has no range rule"
 
-    if not states or op_width == 0:
-        return WIDTH_STATUS_POSSIBLE, "missing width evidence"
+    # VEX Add/Sub/Mul operate on bit patterns. Prove both interpretations.
+    maximum = (1 << width) - 1
+    unsigned = [state.unsigned_bounds or (0, maximum) for state in states]
+    signed = [_signed_bounds(state, width, bounds) for state, bounds in zip(states, unsigned)]
+    ulo, uhi = _result_bounds(op, *unsigned)
+    slo, shi = _result_bounds(op, *signed)
+    sign_bit = 1 << (width - 1)
+    if 0 <= ulo and uhi <= maximum and -sign_bit <= slo and shi < sign_bit:
+        narrow = sink.narrow_use_width
+        if narrow and narrow < width:
+            narrow_sign = 1 << (narrow - 1)
+            if uhi >= 1 << narrow or slo < -narrow_sign or shi >= narrow_sign:
+                return WIDTH_STATUS_POSSIBLE, "result may lose range in a local narrowing conversion"
+        return WIDTH_STATUS_NO, "signed and unsigned result ranges fit"
 
-    if _has_critical_usage(sink):
-        return WIDTH_STATUS_POSSIBLE, "critical usage: keep"
-
-    for state in states:
-        if not _state_is_reliable(state, op_width):
-            return WIDTH_STATUS_POSSIBLE, "operand width/origin unclear"
-        if state.origin == "trunc":
-            return WIDTH_STATUS_POSSIBLE, "trunc operand: keep"
-
-    if _all_operands_widen_before_op(states, op_width):
-        return (
-            WIDTH_STATUS_NO,
-            "widen-before-op: only excludes narrow-width overflow site",
-        )
-
-    has_range_cap, reason = _has_range_cap_evidence(sink)
-    if has_range_cap:
-        return WIDTH_STATUS_NO, reason
-
-    widen_targets = [
-        w.dst_width for w in sink.widen_uses if w.dst_width and w.dst_width > op_width
-    ]
-    if widen_targets:
-        return WIDTH_STATUS_DEPRIORITIZE, "result widened later"
-
-    return WIDTH_STATUS_DEPRIORITIZE, "width-consistent operands without exclusion evidence"
+    if any(sink.notes.get(key) for key in CRITICAL_NOTE_KEYS):
+        return WIDTH_STATUS_POSSIBLE, "critical usage and unproven result range"
+    if sink.widen_uses:
+        return WIDTH_STATUS_DEPRIORITIZE, "result widened later; operation range unproven"
+    return WIDTH_STATUS_POSSIBLE, "result range may exceed the operation width"
 
 
 def screen_by_width(
     sinks: Sequence[ArithmeticOperation],
 ) -> List[Tuple[ArithmeticOperation, str, str]]:
     screened: List[Tuple[ArithmeticOperation, str, str]] = []
-    before = len(sinks)
-    skipped = 0
+    decisions = Counter()
     for sink in sinks:
         status, reason = assess_width_status(sink)
+        decisions[(sink.vex_op, status, reason)] += 1
         sink.notes["width_status"] = status
         sink.notes["width_reason"] = reason
         if status == WIDTH_STATUS_NO:
-            skipped += 1
             if sink.ins_addr is not None:
                 LOG.debug("Width screening drop: %s @ %#x", sink.function, sink.ins_addr)
             continue
         screened.append((sink, status, reason))
-    LOG.info("Width screening: %d -> %d", before, len(screened))
+    LOG.info("Width screening: %d -> %d", len(sinks), len(screened))
+    for (op, status, reason), count in sorted(decisions.items()):
+        LOG.info("Width decisions: %s %s (%s): %d", op, status, reason, count)
     return screened

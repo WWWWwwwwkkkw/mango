@@ -16,7 +16,7 @@
 - Ijk_Call/Ijk_Ret: VEX跳转类型，表示函数调用/返回
 """
 
-from typing import Any
+from typing import Any, Optional
 
 
 import angr
@@ -27,6 +27,7 @@ from angr.analyses.analysis import AnalysisFactory
 from angr.code_location import ExternalCodeLocation
 import networkx as nx
 
+from argument_resolver.utils.guarded_index_rda import GuardedIndexRDA
 from argument_resolver.utils.rda import CustomRDA
 from argument_resolver.utils.transitive_closure import (transitive_closures_from_defs, get_constant_data)
 from argument_resolver.utils.utils import Utils
@@ -34,17 +35,21 @@ from argument_resolver.utils.call_trace import traces_to_sink
 from argument_resolver.utils.call_trace_visitor import CallTraceSubject
 from angr.analyses.reaching_definitions.call_trace import CallTrace
 from argument_resolver.handlers.base import HandlerBase
+from argument_resolver.handlers.option_parser import OptionParserEffects
 from argument_resolver.handlers import (
     handler_factory,
     StdioHandlers,
     StdlibHandlers,
     StringHandlers,
     UnistdHandlers,
+    NetworkHandlers,
 )
 from argument_resolver.external_function import is_an_external_input_function
 from angr.knowledge_plugins.key_definitions.tag import ReturnValueTag, ParameterTag
 
 from angr.knowledge_plugins.key_definitions.atoms import MemoryLocation
+from argument_resolver.utils.integer_overflow_context import BinaryAnalysisContext
+from argument_resolver.utils.overflow_input_evidence import input_evidence
 
 
 def build_operand_atoms(insn, project):
@@ -295,8 +300,9 @@ def trace_external_sources(project, handler, defn, RDA, HandlerCls, depth=0, max
     return traced_sources
 
 
-def trace_operands_from_address(binary_path, sink_address, max_depth=7, 
-                                  cross_function=False):
+def trace_operands_from_address(binary_path, sink_address, max_depth=7,
+                                  cross_function=False, *, context: Optional[BinaryAnalysisContext] = None,
+                                  arithmetic_sink=None):
     """
     从指定地址的算术指令溯源操作数，生成定义链（基于VEX IR分析）
     
@@ -311,6 +317,7 @@ def trace_operands_from_address(binary_path, sink_address, max_depth=7,
     :param sink_address: 算术指令地址（会被转换为VEX IR进行分析）
     :param max_depth: 跨函数追踪的最大深度
     :param cross_function: 是否跨函数追踪（向上追溯调用者，向下追溯被调用函数）
+    :param context: 当前二进制检测调用的共享上下文；省略时独立加载CFG/VRA
     :return: 操作数定义链（包含VEX层面的数据流信息）
     """
     
@@ -318,21 +325,17 @@ def trace_operands_from_address(binary_path, sink_address, max_depth=7,
     print(f"[*] 目标地址: {hex(sink_address)}")
     
     # ========== 步骤1: 初始化项目 ==========
-    project = angr.Project(binary_path, auto_load_libs=False)
-    
-    # 生成CFG
-    print("[*] 生成CFG...")
-    cfg = project.analyses.CFGFast(
-        normalize=True,
-        data_references=True
-    )
-    
-    # 运行VRA（变量恢复）
-    print("[*] 运行VRA...")
-    project.analyses.CompleteCallingConventions(
-        recover_variables=True,
-        analyze_callsites=True
-    )
+    if context is None:
+        project = angr.Project(binary_path, auto_load_libs=False)
+        print("[*] 生成CFG...")
+        project.analyses.CFGFast(normalize=True, data_references=True)
+        print("[*] 运行VRA...")
+        project.analyses.CompleteCallingConventions(
+            recover_variables=True, analyze_callsites=True
+        )
+    else:
+        print("[*] 复用当前二进制检测的CFG/VRA...")
+        project = context.project_for(binary_path)
     
     # ========== 步骤2: 找到地址所在的函数（自动获取，无需手动输入）==========
     sink_function = project.kb.functions.floor_func(sink_address)
@@ -551,10 +554,12 @@ def trace_operands_from_address(binary_path, sink_address, max_depth=7,
             # Step 2: Create handler using handler_factory（保持LocalHandler的默认逻辑）
             print(f"[*] 创建 Handler (使用 handler_factory)...")
             HandlerCls = handler_factory([
+                OptionParserEffects,
                 StdioHandlers,
                 StdlibHandlers,
                 StringHandlers,
                 UnistdHandlers,
+                NetworkHandlers,
             ])
             
             handler = HandlerCls(
@@ -580,7 +585,13 @@ def trace_operands_from_address(binary_path, sink_address, max_depth=7,
             print(f"  • Sink atoms: {len(sink_atoms)}")
             print(f"  • Observation points: {len(observation_points)} (仅sink)")
             
-            RDA = AnalysisFactory(project, CustomRDA)
+            if arithmetic_sink is not None:
+                # Only static CFG facts are shared. Each trace uses its own RD state.
+                handler.guard_ranges = context.guard_ranges if context is not None else {}
+                RDA = AnalysisFactory(project, GuardedIndexRDA)
+                handler.ReachingDefinitionsAnalysis = RDA
+            else:
+                RDA = AnalysisFactory(project, CustomRDA)
             
             # max_iter 仿照Mango的默认值（base.py中使用2，但这里可能需要更多以支持跨函数分析）
             max_iter = max(20, len(trace.callsites) * 5)
@@ -783,7 +794,7 @@ def trace_operands_from_address(binary_path, sink_address, max_depth=7,
                 operand_atoms.append(atom)
                 print(f"  操作数: {reg_name} -> {atom}")
     
-    if not operand_atoms:
+    if not operand_atoms and arithmetic_sink is None:
         print("[!] 未找到寄存器操作数")
         return None
     
@@ -797,6 +808,11 @@ def trace_operands_from_address(binary_path, sink_address, max_depth=7,
         'cross_function': cross_function,
         'operands': []
     }
+    if arithmetic_sink is not None:
+        evidence = input_evidence(project, arithmetic_sink, state, handler)
+        evidence["analysis"] = "cross_function" if cross_function else "function_local"
+        evidence["candidate_chains"] = len(traces) if cross_function else 0
+        result["input_evidence"] = evidence
     
     # 如果是跨函数分析，添加调用链信息
     if cross_function and trace.callsites:

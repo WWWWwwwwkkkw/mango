@@ -21,9 +21,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 LOG = logging.getLogger(__name__)
 
-DEFAULT_API_URL = "xxx"
-DEFAULT_MODEL = "xxx"
-DEFAULT_API_TOKEN = "xxx"
+DEFAULT_API_URL = ""
+DEFAULT_MODEL = ""
+DEFAULT_API_TOKEN = ""
 SINK_FILENAME_RE = re.compile(r"^sink_(\d+)\.json$")
 
 
@@ -80,6 +80,14 @@ def _build_start_prompt(sink: SinkInput) -> str:
     instruction = payload.get("instruction") or "unknown"
     disassembly_context = payload.get("disassembly_context") or []
     disassembly_text = _format_disassembly_context(disassembly_context)
+    evidence_text = ""
+    if payload.get("input_evidence"):
+        evidence_text = (
+            "Operand evidence from the selected static trace, in VEX input order. "
+            "Use expression and index to match each source to its operand. "
+            "Empty sources leave provenance unknown. Observed values apply only to this trace.\n"
+            + json.dumps(payload["input_evidence"], ensure_ascii=False) + "\n\n"
+        )
     
     case_id = f"sink_{sink.index}_{sink_address}"
     
@@ -97,6 +105,7 @@ def _build_start_prompt(sink: SinkInput) -> str:
         f"- sink_semantic: unknown (to be determined)\n\n"
         "Disassembly context (around sink):\n"
         f"{disassembly_text}\n\n"
+        f"{evidence_text}"
         "Task:\n"
         "Initialize a JSON state for this sink:\n"
         "- Create operands O1, O2, ... from sink_expr operands\n"
@@ -456,17 +465,17 @@ def _cli_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--api-url",
-        default=DEFAULT_API_URL,
+        default=os.getenv("MANGO_LLM_API_URL") or DEFAULT_API_URL,
         help="Chat completion API endpoint.",
     )
     parser.add_argument(
         "--api-token",
-        default=DEFAULT_API_TOKEN,
+        default=os.getenv("MANGO_LLM_API_TOKEN") or DEFAULT_API_TOKEN,
         help="API token for the LLM endpoint.",
     )
     parser.add_argument(
         "--model",
-        default=DEFAULT_MODEL,
+        default=os.getenv("MANGO_LLM_MODEL") or DEFAULT_MODEL,
         help="Model identifier used by the LLM endpoint.",
     )
     parser.add_argument(
@@ -492,6 +501,8 @@ def _cli_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
     args = _cli_args(argv)
+    if not (args.api_url and args.api_token and args.model):
+        raise SystemExit("Set MANGO_LLM_API_URL, MANGO_LLM_API_TOKEN, and MANGO_LLM_MODEL for LLM analysis.")
     logging.basicConfig(level=getattr(logging, args.log_level))
     results_dir = args.results
     output_dir = args.output or results_dir

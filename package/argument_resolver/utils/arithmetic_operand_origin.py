@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import angr
+from capstone import CS_OP_MEM
 from angr.analyses.reaching_definitions.dep_graph import DepGraph
 from angr.knowledge_plugins.key_definitions.atoms import Atom, MemoryLocation, Register
 from angr.knowledge_plugins.key_definitions.constants import OP_BEFORE, OP_AFTER
@@ -34,6 +35,7 @@ from argument_resolver.utils.transitive_closure import (
 )
 from argument_resolver.utils.utils import Utils
 from argument_resolver.utils.vex_helpers import codeloc_hits_dirty
+from argument_resolver.utils.integer_overflow_context import BinaryAnalysisContext
 
 
 def _load_project(binary_path: str) -> angr.Project:
@@ -550,25 +552,34 @@ def _summarize_operand(
     return summary
 
 
-def analyze_arithmetic_operands(
-    binary_path: str, sink_address: int
-) -> Dict[str, Any]:
-    """
-    Run a single-function reaching-definition analysis on ``sink_address`` and
-    report where each operand pulls its data from.
-    """
-
-    project = _load_project(binary_path)
+def _inspect_arithmetic_instruction(binary_path, sink_address, context):
+    project = context.project_for(binary_path) if context is not None else _load_project(binary_path)
     sink_function = project.kb.functions.floor_func(sink_address)
     if not sink_function:
         raise ValueError(f"Address {hex(sink_address)} is not inside a function")
 
     insn = _resolve_instruction(project, sink_address)
     base_atoms = _build_operand_atoms(insn, project)
-    if not base_atoms:
+    if not base_atoms and not any(op.type == CS_OP_MEM for op in insn.operands):
         raise ValueError(
-            f"Instruction {insn.mnemonic} {insn.op_str} has no register operands"
+            f"Instruction {insn.mnemonic} {insn.op_str} has no register or memory operands"
         )
+    return project, sink_function, insn, base_atoms
+
+
+def describe_arithmetic_instruction(
+    binary_path: str, sink_address: int, *, context: Optional[BinaryAnalysisContext] = None
+) -> Dict[str, Any]:
+    """Decode the instruction used by CLI reports and apply operand eligibility checks."""
+    _, _, insn, _ = _inspect_arithmetic_instruction(binary_path, sink_address, context)
+    return {"instruction": f"{insn.mnemonic} {insn.op_str}"}
+
+
+def analyze_arithmetic_operands(
+    binary_path: str, sink_address: int, *, context: Optional[BinaryAnalysisContext] = None
+) -> Dict[str, Any]:
+    """Run function-local RDA and report definitions and sources for each operand."""
+    project, sink_function, insn, base_atoms = _inspect_arithmetic_instruction(binary_path, sink_address, context)
 
     observation = ("insn", sink_address, OP_BEFORE)
     observation_points: Set[Tuple[str, int, int]] = {observation}
