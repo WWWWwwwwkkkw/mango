@@ -495,10 +495,12 @@ class LocalHandler(HandlerBase):
         # Get all nodes reachable from the root nodes
         func_queue = [stored_func]
         white_list = []
+        white_list_set: Set[StoredFunction] = set()
         while func_queue:
             root_defns: Set[Definition] = set()
             func = func_queue.pop(0)
             white_list.append(func)
+            white_list_set.add(func)
 
             if func == stored_func:
                 if in_subject:
@@ -535,7 +537,7 @@ class LocalHandler(HandlerBase):
 
             valid_funcs = []
             for t_f in truncated_trace.copy():
-                if t_f in white_list:
+                if t_f in white_list_set:
                     continue
                 if any(d in new_defns for d in t_f.definitions | t_f.return_definitions) and t_f.function is not None:
                     valid_funcs.append(t_f)
